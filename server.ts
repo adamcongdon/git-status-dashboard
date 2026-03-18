@@ -1,28 +1,119 @@
-import { readdir, stat } from "fs/promises";
-import { join } from "path";
+import { readdir, stat, readFile, writeFile } from "fs/promises";
+import { join, resolve } from "path";
 import { homedir } from "os";
+import { createInterface } from "readline/promises";
 
-const PROJECTS_DIR = join(homedir(), "code");
+const CONFIG_PATH = join(import.meta.dir, "config.json");
 const PORT = 3847;
+const DEBUG = process.argv.includes("--debug");
 
-async function getGitRepos(): Promise<string[]> {
-  const entries = await readdir(PROJECTS_DIR, { withFileTypes: true });
-  const repos: string[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === "git-status-dashboard") continue;
-    const gitDir = join(PROJECTS_DIR, entry.name, ".git");
-    try {
-      const s = await stat(gitDir);
-      if (s.isDirectory()) repos.push(entry.name);
-    } catch {
-      // not a git repo
-    }
+function log(...args: unknown[]) {
+  console.log(`[${new Date().toLocaleTimeString()}]`, ...args);
+}
+function dbg(...args: unknown[]) {
+  if (DEBUG) console.log(`[DBG ${new Date().toLocaleTimeString()}]`, ...args);
+}
+
+interface Config {
+  projectDirs: string[];
+}
+
+interface RepoInfo {
+  name: string;
+  path: string;
+  folder: string;
+}
+
+function expandHome(p: string): string {
+  if (p.startsWith("~/") || p === "~") {
+    return join(homedir(), p.slice(1));
   }
-  return repos.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  return p;
+}
+
+async function loadConfig(): Promise<Config> {
+  try {
+    const raw = await readFile(CONFIG_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed.projectDirs) && parsed.projectDirs.length > 0) {
+      return parsed as Config;
+    }
+  } catch {
+    // config missing or invalid
+  }
+  return await runSetup();
+}
+
+async function runSetup(): Promise<Config> {
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  console.log("\nGit Status Dashboard — First-time setup\n");
+  const answer = await rl.question(
+    "Enter project directories to scan (comma-separated, default: ~/code):\n> ",
+  );
+  rl.close();
+
+  const dirs =
+    answer.trim() === ""
+      ? [join(homedir(), "code")]
+      : answer
+          .split(",")
+          .map((d) => expandHome(d.trim()))
+          .filter((d) => d.length > 0);
+
+  const config: Config = { projectDirs: dirs };
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+  console.log(`\nConfig saved to ${CONFIG_PATH}`);
+  console.log(`Scanning directories: ${dirs.join(", ")}\n`);
+  return config;
+}
+
+async function getGitRepos(config: Config): Promise<RepoInfo[]> {
+  const selfDir = resolve(import.meta.dir);
+  const repos: RepoInfo[] = [];
+
+  for (const dir of config.projectDirs) {
+    const resolvedDir = resolve(dir);
+    log(`Scanning directory: ${resolvedDir}`);
+
+    let entries;
+    try {
+      entries = await readdir(resolvedDir, { withFileTypes: true });
+    } catch (e: any) {
+      log(`WARNING: cannot read ${resolvedDir}: ${e.message}`);
+      continue;
+    }
+
+    const dirs = entries.filter(e => e.isDirectory());
+    dbg(`  ${dirs.length} subdirectories found in ${resolvedDir}`);
+
+    for (const entry of dirs) {
+      const fullPath = join(resolvedDir, entry.name);
+      if (resolve(fullPath) === selfDir) {
+        dbg(`  Skipping self: ${entry.name}`);
+        continue;
+      }
+      const gitDir = join(fullPath, ".git");
+      try {
+        const s = await stat(gitDir);
+        if (s.isDirectory()) {
+          dbg(`  Found repo: ${entry.name}`);
+          repos.push({ name: entry.name, path: fullPath, folder: resolvedDir });
+        }
+      } catch {
+        dbg(`  Not a repo: ${entry.name}`);
+      }
+    }
+
+    log(`  Found ${repos.length} git repos in ${resolvedDir}`);
+  }
+
+  return repos.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 }
 
 interface RepoStatus {
   name: string;
+  path: string;
+  folder: string;
   branch: string;
   uncommitted: number;
   ahead: number;
@@ -33,20 +124,50 @@ interface RepoStatus {
 }
 
 async function runGit(repoPath: string, args: string[]): Promise<string> {
+  dbg(`  git ${args.join(" ")}  (in ${repoPath})`);
   const proc = Bun.spawn(["git", ...args], {
     cwd: repoPath,
     stdout: "pipe",
     stderr: "pipe",
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "echo" },
   });
-  const text = await new Response(proc.stdout).text();
+
+  const textPromise = new Response(proc.stdout).text();
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => { proc.kill(); reject(new Error(`git ${args[0]} timed out after 5s`)); }, 5000)
+  );
+
+  const text = await Promise.race([textPromise, timeout]);
   await proc.exited;
   return text.trim();
 }
 
-async function getRepoStatus(name: string): Promise<RepoStatus> {
-  const repoPath = join(PROJECTS_DIR, name);
+async function pMap<T, R>(
+  items: T[],
+  fn: (item: T, index: number) => Promise<R>,
+  concurrency: number,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      results[idx] = await fn(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+}
+
+async function getRepoStatus(repo: RepoInfo, index: number, total: number): Promise<RepoStatus> {
+  const repoPath = repo.path;
+  const pad = String(total).length;
+  process.stdout.write(`  [${String(index + 1).padStart(pad)}/${total}] ${repo.name} ... `);
+  const t = performance.now();
   const status: RepoStatus = {
-    name,
+    name: repo.name,
+    path: repo.path,
+    folder: repo.folder,
     branch: "",
     uncommitted: 0,
     ahead: 0,
@@ -97,6 +218,8 @@ async function getRepoStatus(name: string): Promise<RepoStatus> {
     status.error = e.message || "Unknown error";
   }
 
+  const ms = Math.round(performance.now() - t);
+  console.log(status.error ? `error (${ms}ms)` : `${status.branch} (${ms}ms)`);
   return status;
 }
 
@@ -240,7 +363,7 @@ function renderHTML(): string {
   }
   .filter-btn.active { background: #1f6feb; color: #f0f6fc; border-color: #1f6feb; }
   .filter-btn .count { margin-left: 4px; opacity: 0.7; }
-  .card-actions { margin-top: 10px; }
+  .card-actions { margin-top: 10px; display: flex; gap: 8px; }
   .open-btn {
     font-size: 12px;
     padding: 4px 10px;
@@ -252,6 +375,7 @@ function renderHTML(): string {
     transition: background 0.15s, color 0.15s;
   }
   .open-btn:hover { background: #30363d; color: #c9d1d9; }
+  .folder-label { font-size: 11px; color: #8b949e; margin-bottom: 6px; }
 </style>
 </head>
 <body>
@@ -268,16 +392,24 @@ function renderHTML(): string {
 let allRepos = [];
 let activeFilter = "all";
 
-async function openInVSCode(name) {
+async function openInVSCode(path) {
   await fetch("/api/open", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ path }),
+  });
+}
+
+async function revealInFinder(path) {
+  await fetch("/api/reveal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path }),
   });
 }
 
 async function fetchRepos() {
-  const res = await fetch("/api/repos");
+  const res = await fetch("/api/repos?t=" + Date.now());
   return res.json();
 }
 
@@ -335,6 +467,7 @@ function renderRepos(repos) {
   const dirty = repos.filter(r => r.uncommitted > 0).length;
   const needsPush = repos.filter(r => r.ahead > 0).length;
   const needsPull = repos.filter(r => r.behind > 0).length;
+  const showFolder = new Set(repos.map(r => r.folder)).size > 1;
 
   document.getElementById("summary").textContent =
     repos.length + " repos | " + dirty + " uncommitted | " + needsPush + " to push | " + needsPull + " to pull";
@@ -373,14 +506,20 @@ function renderRepos(repos) {
         }
       }
 
+      const folderLabel = showFolder
+        ? '<div class="folder-label">📁 ' + repo.folder.split('/').pop() + '</div>'
+        : '';
+
       return '<div class="card ' + cls + '">' +
+        folderLabel +
         '<div class="card-header">' +
           '<span class="repo-name">' + repo.name + '</span>' +
           '<span class="branch">' + (repo.branch || "?") + '</span>' +
         '</div>' +
         '<div class="badges">' + badges + '</div>' +
         '<div class="card-actions">' +
-          '<button class="open-btn" onclick="openInVSCode(\\'' + repo.name + '\\')">Open in VS Code</button>' +
+          '<button class="open-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="openInVSCode(this.dataset.path)">Open in VS Code</button>' +
+          '<button class="open-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="revealInFinder(this.dataset.path)">Reveal in Finder</button>' +
         '</div>' +
       '</div>';
     }).join("") +
@@ -410,39 +549,85 @@ refresh();
 </html>`;
 }
 
-const cachedHTML = renderHTML();
+async function main() {
+  const config = await loadConfig();
+  const cachedHTML = renderHTML();
 
-const server = Bun.serve({
-  port: PORT,
-  async fetch(req) {
-    const url = new URL(req.url);
+  const server = Bun.serve({
+    port: PORT,
+    async fetch(req) {
+      const url = new URL(req.url);
+      log(`→ ${req.method} ${url.pathname}`);
 
-    if (url.pathname === "/api/open" && req.method === "POST") {
-      const body = await req.json();
-      const name = body.name;
-      if (!name || name.includes("..") || name.includes("/")) {
-        return Response.json({ error: "Invalid repo name" }, { status: 400 });
+      if (url.pathname === "/api/open" && req.method === "POST") {
+        const body = await req.json();
+        const rawPath = body.path;
+        if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
+          return Response.json({ error: "Invalid path" }, { status: 400 });
+        }
+        const resolved = resolve(rawPath);
+        const allowed = config.projectDirs.some(
+          (dir) => resolved.startsWith(resolve(dir) + "/"),
+        );
+        if (!allowed) {
+          return Response.json({ error: "Path not in configured directories" }, { status: 403 });
+        }
+        const proc = Bun.spawn(["code", resolved], { stdout: "ignore", stderr: "ignore" });
+        await proc.exited;
+        return Response.json({ ok: true });
       }
-      const repoPath = join(PROJECTS_DIR, name);
-      const proc = Bun.spawn(["code", repoPath], { stdout: "ignore", stderr: "ignore" });
-      await proc.exited;
-      return Response.json({ ok: true });
-    }
 
-    if (url.pathname === "/api/repos") {
-      const repos = await getGitRepos();
-      const statuses = await Promise.all(repos.map(getRepoStatus));
-      return Response.json(statuses);
-    }
+      if (url.pathname === "/api/reveal" && req.method === "POST") {
+        const body = await req.json();
+        const rawPath = body.path;
+        if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
+          return Response.json({ error: "Invalid path" }, { status: 400 });
+        }
+        const resolved = resolve(rawPath);
+        const allowed = config.projectDirs.some(
+          (dir) => resolved.startsWith(resolve(dir) + "/"),
+        );
+        if (!allowed) {
+          return Response.json({ error: "Path not in configured directories" }, { status: 403 });
+        }
+        const cmd = process.platform === "win32"
+          ? ["explorer", `/select,${resolved}`]
+          : ["open", "-R", resolved];
+        const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" });
+        await proc.exited;
+        return Response.json({ ok: true });
+      }
 
-    if (url.pathname === "/") {
-      return new Response(cachedHTML, {
-        headers: { "Content-Type": "text/html" },
-      });
-    }
+      if (url.pathname === "/api/repos" && req.method === "GET") {
+        const t0 = performance.now();
+        log(`Scan requested. Dirs: ${config.projectDirs.join(", ")}`);
+        const repos = await getGitRepos(config);
+        log(`Fetching status for ${repos.length} repos (concurrency: 8)...`);
+        const statuses = await pMap(
+          repos,
+          (repo, i) => getRepoStatus(repo, i, repos.length),
+          8,
+        );
+        log(`Scan complete in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+        return Response.json(statuses);
+      }
 
-    return new Response("Not found", { status: 404 });
-  },
-});
+      if (url.pathname === "/api/config") {
+        return Response.json({ projectDirs: config.projectDirs });
+      }
 
-console.log(`Git Status Dashboard running at http://localhost:${PORT}`);
+      if (url.pathname === "/") {
+        return new Response(cachedHTML, {
+          headers: { "Content-Type": "text/html", "Connection": "close" },
+        });
+      }
+
+      return new Response("Not found", { status: 404 });
+    },
+  });
+
+  log(`Git Status Dashboard running at http://localhost:${PORT}${DEBUG ? "  [DEBUG MODE]" : ""}`);
+  log(`Watching: ${config.projectDirs.join(", ")}`);
+}
+
+main();

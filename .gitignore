@@ -1,0 +1,6 @@
+# User-specific config (contains local directory paths)
+config.json
+
+# Bun
+node_modules/
+bun.lockb
