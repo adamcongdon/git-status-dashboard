@@ -230,6 +230,7 @@ function renderHTML(): string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Git Status Dashboard</title>
+<link rel="icon" type="image/jpeg" href="/favicon.jpg">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -376,16 +377,102 @@ function renderHTML(): string {
   }
   .open-btn:hover { background: #30363d; color: #c9d1d9; }
   .folder-label { font-size: 11px; color: #8b949e; margin-bottom: 6px; }
+  #autoRefreshSelect {
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    padding: 7px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  #autoRefreshSelect.active { color: #58a6ff; border-color: #1f6feb; }
+  .delete-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+    background: transparent;
+    border: 1px solid #da3633;
+    color: #f85149;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-left: auto;
+    transition: background 0.15s, color 0.15s;
+  }
+  .delete-btn:hover { background: #2d0000; }
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-overlay.visible { display: flex; }
+  .modal {
+    background: #161b22;
+    border: 1px solid #da3633;
+    border-radius: 10px;
+    padding: 28px 32px;
+    max-width: 420px;
+    width: 90%;
+  }
+  .modal h2 { font-size: 18px; color: #f85149; margin-bottom: 8px; }
+  .modal p { font-size: 14px; color: #8b949e; margin-bottom: 6px; }
+  .modal .repo-path { font-size: 12px; color: #c9d1d9; font-family: monospace; background: #0d1117; padding: 6px 10px; border-radius: 4px; margin-bottom: 20px; word-break: break-all; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-cancel { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  .modal-cancel:hover { background: #30363d; }
+  .modal-confirm { background: #da3633; color: #fff; border: none; padding: 8px 18px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  .modal-confirm:hover { background: #f85149; }
+  .modal-confirm:disabled { opacity: 0.5; cursor: wait; }
+  .status-banner {
+    display: none;
+    margin-bottom: 16px;
+    padding: 10px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    border: 1px solid #30363d;
+    background: #161b22;
+    color: #c9d1d9;
+    white-space: pre-wrap;
+    font-family: monospace;
+  }
+  .status-banner.success { border-color: #238636; background: #0d1f0d; color: #3fb950; }
+  .status-banner.info { border-color: #1f6feb; background: #0a1929; color: #58a6ff; }
+  .status-banner.warn { border-color: #9e6a03; background: #2a1f00; color: #d29922; }
 </style>
 </head>
 <body>
 <header>
-  <h1>Git Status Dashboard</h1>
+  <h1><img src="/favicon.jpg" alt="" style="width:32px;height:32px;border-radius:6px;vertical-align:middle;margin-right:10px;">Git Status Dashboard</h1>
   <div class="header-right">
     <span class="summary" id="summary"></span>
     <button onclick="refresh()" id="refreshBtn">Refresh</button>
+    <select id="autoRefreshSelect" onchange="setAutoRefresh(this.value)" title="Auto-refresh interval">
+      <option value="0">Auto: Off</option>
+      <option value="30">Auto: 30s</option>
+      <option value="60">Auto: 1m</option>
+      <option value="300">Auto: 5m</option>
+      <option value="900">Auto: 15m</option>
+      <option value="1800">Auto: 30m</option>
+    </select>
+    <button onclick="updateServer()" id="updateBtn">Check for Updates</button>
+    <button onclick="restartServer()" id="restartBtn">Restart Server</button>
   </div>
 </header>
+<div class="status-banner" id="statusBanner"></div>
+<div class="modal-overlay" id="deleteModal">
+  <div class="modal">
+    <h2>Delete Repository?</h2>
+    <p>This will permanently delete the folder from disk. This cannot be undone.</p>
+    <div class="repo-path" id="deleteModalPath"></div>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeDeleteModal()">Cancel</button>
+      <button class="modal-confirm" id="deleteConfirmBtn" onclick="confirmDelete()">Delete Forever</button>
+    </div>
+  </div>
+</div>
 <div class="filter-bar" id="filters"></div>
 <div id="content"><div class="loading"><span class="spinner"></span>Scanning repositories...</div></div>
 <script>
@@ -520,6 +607,7 @@ function renderRepos(repos) {
         '<div class="card-actions">' +
           '<button class="open-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="openInVSCode(this.dataset.path)">Open in VS Code</button>' +
           '<button class="open-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="revealInFinder(this.dataset.path)">Reveal in Finder</button>' +
+          '<button class="delete-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" data-name="' + repo.name.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="openDeleteModal(this.dataset.path, this.dataset.name)">Delete</button>' +
         '</div>' +
       '</div>';
     }).join("") +
@@ -542,6 +630,132 @@ async function refresh() {
   btn.disabled = false;
   btn.textContent = "Refresh";
 }
+
+function showBanner(msg, type) {
+  const el = document.getElementById("statusBanner");
+  el.textContent = msg;
+  el.className = "status-banner " + (type || "");
+  el.style.display = "block";
+}
+
+function hideBanner() {
+  document.getElementById("statusBanner").style.display = "none";
+}
+
+async function updateServer() {
+  const btn = document.getElementById("updateBtn");
+  btn.disabled = true;
+  btn.textContent = "Pulling...";
+  showBanner("Running git pull...", "info");
+  try {
+    const res = await fetch("/api/update", { method: "POST" });
+    const data = await res.json();
+    if (data.alreadyUpToDate) {
+      showBanner("Already up to date.", "success");
+    } else {
+      showBanner("Update applied:\\n" + data.output + "\\n\\nClick 'Restart Server' to load the new version.", "warn");
+    }
+  } catch (e) {
+    showBanner("Update failed: " + e.message, "");
+  }
+  btn.disabled = false;
+  btn.textContent = "Check for Updates";
+}
+
+async function restartServer() {
+  const btn = document.getElementById("restartBtn");
+  btn.disabled = true;
+  btn.textContent = "Restarting...";
+  showBanner("Restarting server... page will reload automatically.", "info");
+  try {
+    await fetch("/api/restart", { method: "POST" });
+  } catch { /* expected — server closes connection */ }
+  // Poll until back up
+  const start = Date.now();
+  const poll = setInterval(async () => {
+    if (Date.now() - start > 15000) {
+      clearInterval(poll);
+      showBanner("Server did not respond after 15s. Reload manually.", "");
+      btn.disabled = false;
+      btn.textContent = "Restart Server";
+      return;
+    }
+    try {
+      const r = await fetch("/api/config");
+      if (r.ok) {
+        clearInterval(poll);
+        showBanner("Server restarted successfully.", "success");
+        btn.disabled = false;
+        btn.textContent = "Restart Server";
+        refresh();
+      }
+    } catch { /* still restarting */ }
+  }, 1000);
+}
+
+let autoRefreshTimer = null;
+
+function setAutoRefresh(seconds, save = true) {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
+  const sel = document.getElementById("autoRefreshSelect");
+  sel.value = String(seconds);
+  if (save) localStorage.setItem("autoRefreshInterval", String(seconds));
+  if (seconds == 0) {
+    sel.classList.remove("active");
+    return;
+  }
+  sel.classList.add("active");
+  autoRefreshTimer = setInterval(() => {
+    if (!document.getElementById("refreshBtn").disabled) refresh();
+  }, seconds * 1000);
+}
+
+let pendingDeletePath = null;
+
+function openDeleteModal(path, name) {
+  pendingDeletePath = path;
+  document.getElementById("deleteModalPath").textContent = path;
+  document.getElementById("deleteConfirmBtn").disabled = false;
+  document.getElementById("deleteModal").classList.add("visible");
+}
+
+function closeDeleteModal() {
+  pendingDeletePath = null;
+  document.getElementById("deleteModal").classList.remove("visible");
+}
+
+async function confirmDelete() {
+  if (!pendingDeletePath) return;
+  const btn = document.getElementById("deleteConfirmBtn");
+  btn.disabled = true;
+  btn.textContent = "Deleting...";
+  try {
+    const res = await fetch("/api/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: pendingDeletePath }),
+    });
+    const data = await res.json();
+    closeDeleteModal();
+    if (data.ok) {
+      showBanner("Deleted: " + pendingDeletePath, "warn");
+      refresh();
+    } else {
+      showBanner("Delete failed: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("Delete failed: " + e.message, "");
+    closeDeleteModal();
+  }
+}
+
+// Close modal on overlay click
+document.getElementById("deleteModal").addEventListener("click", function(e) {
+  if (e.target === this) closeDeleteModal();
+});
+
+const savedInterval = localStorage.getItem("autoRefreshInterval");
+if (savedInterval && savedInterval !== "0") setAutoRefresh(Number(savedInterval), false);
 
 refresh();
 </script>
@@ -614,6 +828,71 @@ async function main() {
 
       if (url.pathname === "/api/config") {
         return Response.json({ projectDirs: config.projectDirs });
+      }
+
+      if (url.pathname === "/api/update" && req.method === "POST") {
+        const serverDir = import.meta.dir;
+        const proc = Bun.spawn(["git", "pull"], {
+          cwd: serverDir,
+          stdout: "pipe",
+          stderr: "pipe",
+          env: { ...process.env },
+        });
+        const [stdout, stderr] = await Promise.all([
+          new Response(proc.stdout).text(),
+          new Response(proc.stderr).text(),
+        ]);
+        await proc.exited;
+        const output = (stdout + stderr).trim();
+        const alreadyUpToDate = output.includes("Already up to date");
+        log(`Update check: ${output}`);
+        return Response.json({ ok: true, output, alreadyUpToDate });
+      }
+
+      if (url.pathname === "/api/delete" && req.method === "POST") {
+        const body = await req.json();
+        const rawPath = body.path;
+        if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
+          return Response.json({ error: "Invalid path" }, { status: 400 });
+        }
+        const resolved = resolve(rawPath);
+        const allowed = config.projectDirs.some(
+          (dir) => resolved.startsWith(resolve(dir) + "/"),
+        );
+        if (!allowed) {
+          return Response.json({ error: "Path not in configured directories" }, { status: 403 });
+        }
+        // Must be a git repo
+        const gitDir = join(resolved, ".git");
+        try {
+          await stat(gitDir);
+        } catch {
+          return Response.json({ error: "Not a git repository" }, { status: 400 });
+        }
+        const proc = Bun.spawn(["rm", "-rf", resolved], { stdout: "ignore", stderr: "pipe" });
+        const errText = await new Response(proc.stderr).text();
+        await proc.exited;
+        if (errText.trim()) {
+          log(`Delete error for ${resolved}: ${errText}`);
+          return Response.json({ error: errText.trim() }, { status: 500 });
+        }
+        log(`Deleted repo: ${resolved}`);
+        return Response.json({ ok: true });
+      }
+
+      if (url.pathname === "/api/restart" && req.method === "POST") {
+        log("Restart requested via UI — exiting for launchd restart");
+        setTimeout(() => process.exit(0), 300);
+        return Response.json({ ok: true, message: "Restarting..." });
+      }
+
+      if (url.pathname === "/favicon.jpg" || url.pathname === "/favicon.ico") {
+        try {
+          const img = await readFile(join(import.meta.dir, "favicon.jpg"));
+          return new Response(img, { headers: { "Content-Type": "image/jpeg" } });
+        } catch {
+          return new Response("Not found", { status: 404 });
+        }
       }
 
       if (url.pathname === "/") {

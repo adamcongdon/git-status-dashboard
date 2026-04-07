@@ -1,8 +1,8 @@
 # Git Status Dashboard
 
-A local web dashboard that scans your project directories for Git repositories and shows their status at a glance — uncommitted changes, branches ahead/behind, detached heads, and more.
+<img src="favicon.jpg" alt="Git Status Dashboard icon" width="80" align="right" style="border-radius:10px;margin-left:16px;">
 
-![Dashboard showing repository cards with status badges](https://placeholder-screenshot.png)
+A local web dashboard that scans your project directories for Git repositories and shows their status at a glance — uncommitted changes, branches ahead/behind, detached heads, and more. Runs entirely on your machine as a persistent macOS LaunchAgent.
 
 ## Features
 
@@ -10,7 +10,10 @@ A local web dashboard that scans your project directories for Git repositories a
 - Shows uncommitted changes, ahead/behind counts, branch name, and remote status per repo
 - Filter by status: All, Uncommitted, Ahead/Behind, Clean, No Remote
 - Open any repo directly in VS Code or reveal it in Finder
-- Refreshes on demand; no file watching or polling overhead
+- **Delete** a repository folder from disk (with confirmation dialog)
+- **Auto-refresh** on a tunable interval (30s → 30m) — setting persists across page reloads
+- **Check for Updates** — runs `git pull` on the dashboard itself and shows the output
+- **Restart Server** — triggers a graceful restart via the UI (launchd auto-restarts the process)
 - Runs entirely locally — no external services, no telemetry
 
 ## Requirements
@@ -109,8 +112,9 @@ The dashboard runs on port **3847**. To change it, edit the `PORT` constant at t
 
 ```
 git-status-dashboard/
-├── server.ts        # Bun HTTP server + git scanning logic
-├── config.json      # Your directory config (created on first run, gitignored)
+├── server.ts        # Bun HTTP server + git scanning logic + embedded UI
+├── config.json      # Your directory config (created on first run)
+├── favicon.jpg      # App icon (served at /favicon.jpg and /favicon.ico)
 ├── install.sh       # macOS LaunchAgent installer
 └── uninstall.sh     # Reverses the installer
 ```
@@ -125,3 +129,15 @@ On each `/api/repos` request, the server:
 4. Returns the results as JSON; the browser renders them as cards
 
 Each git operation has a 5-second timeout to prevent a single slow repo from blocking the scan.
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/repos` | Scan all configured directories and return repo statuses |
+| GET | `/api/config` | Return current `config.json` contents |
+| POST | `/api/open` | Open a repo path in VS Code |
+| POST | `/api/reveal` | Reveal a repo path in Finder |
+| POST | `/api/delete` | Delete a repo folder from disk (path must be within configured dirs) |
+| POST | `/api/update` | Run `git pull` on the dashboard repo itself |
+| POST | `/api/restart` | Exit the process (launchd restarts it automatically) |
