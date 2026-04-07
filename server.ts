@@ -68,7 +68,6 @@ async function runSetup(): Promise<Config> {
 }
 
 async function getGitRepos(config: Config): Promise<RepoInfo[]> {
-  const selfDir = resolve(import.meta.dir);
   const repos: RepoInfo[] = [];
 
   for (const dir of config.projectDirs) {
@@ -88,10 +87,6 @@ async function getGitRepos(config: Config): Promise<RepoInfo[]> {
 
     for (const entry of dirs) {
       const fullPath = join(resolvedDir, entry.name);
-      if (resolve(fullPath) === selfDir) {
-        dbg(`  Skipping self: ${entry.name}`);
-        continue;
-      }
       const gitDir = join(fullPath, ".git");
       try {
         const s = await stat(gitDir);
@@ -120,7 +115,55 @@ interface RepoStatus {
   behind: number;
   hasRemote: boolean;
   detached: boolean;
+  lastCommitDate: string;
   error?: string;
+}
+
+function validateRepoPath(rawPath: unknown, config: Config): { resolved: string } | { error: string; status: number } {
+  if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
+    return { error: "Invalid path", status: 400 };
+  }
+  const resolved = resolve(rawPath);
+  const allowed = config.projectDirs.some(
+    (dir) => resolved.startsWith(resolve(dir) + "/"),
+  );
+  if (!allowed) return { error: "Path not in configured directories", status: 403 };
+  return { resolved };
+}
+
+const INFERENCE_PATH = join(homedir(), ".claude", "PAI", "Tools", "Inference.ts");
+let AI_AVAILABLE = false;
+
+async function checkAIAvailable(): Promise<boolean> {
+  try {
+    await stat(INFERENCE_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runInference(systemPrompt: string, userPrompt: string, timeoutMs = 30000): Promise<string> {
+  const proc = Bun.spawn(["bun", INFERENCE_PATH, "--level", "fast", systemPrompt, userPrompt], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env },
+  });
+
+  const textPromise = new Response(proc.stdout).text();
+  const errPromise = new Response(proc.stderr).text();
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => { proc.kill(); reject(new Error(`AI inference timed out after ${timeoutMs / 1000}s`)); }, timeoutMs)
+  );
+
+  const text = await Promise.race([textPromise, timeout]);
+  await proc.exited;
+  const trimmed = text.trim();
+  if (!trimmed) {
+    const errText = await errPromise;
+    throw new Error(errText.trim() || "Empty response from AI");
+  }
+  return trimmed;
 }
 
 async function runGit(repoPath: string, args: string[]): Promise<string> {
@@ -174,14 +217,16 @@ async function getRepoStatus(repo: RepoInfo, index: number, total: number): Prom
     behind: 0,
     hasRemote: false,
     detached: false,
+    lastCommitDate: "",
   };
 
   try {
     // Run independent git commands in parallel
-    const [branch, porcelain, remotes] = await Promise.all([
+    const [branch, porcelain, remotes, lastLog] = await Promise.all([
       runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]),
       runGit(repoPath, ["status", "--porcelain"]),
       runGit(repoPath, ["remote"]),
+      runGit(repoPath, ["log", "-1", "--format=%aI"]).catch(() => ""),
     ]);
 
     status.branch = branch;
@@ -190,6 +235,7 @@ async function getRepoStatus(repo: RepoInfo, index: number, total: number): Prom
     }
     status.uncommitted = porcelain ? porcelain.split("\n").length : 0;
     status.hasRemote = remotes.length > 0;
+    status.lastCommitDate = lastLog;
 
     // Ahead/behind (depends on branch and remote results)
     if (status.hasRemote && !status.detached) {
@@ -325,6 +371,8 @@ function renderHTML(): string {
   .badge-no-remote { background: #1f1f1f; color: #8b949e; border: 1px solid #484f58; }
   .badge-detached { background: #2a1500; color: #d29922; border: 1px solid #9e6a03; }
   .badge-error { background: #2d0000; color: #f85149; border: 1px solid #da3633; }
+  .badge-stale { background: #1f1f1f; color: #8b949e; border: 1px solid #484f58; }
+  .last-commit { font-size: 11px; color: #484f58; margin-top: 6px; }
   .card.clean { border-left: 3px solid #238636; }
   .card.dirty { border-left: 3px solid #d29922; }
   .card.pending { border-left: 3px solid #58a6ff; }
@@ -441,6 +489,47 @@ function renderHTML(): string {
   .status-banner.success { border-color: #238636; background: #0d1f0d; color: #3fb950; }
   .status-banner.info { border-color: #1f6feb; background: #0a1929; color: #58a6ff; }
   .status-banner.warn { border-color: #9e6a03; background: #2a1f00; color: #d29922; }
+  .action-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+    background: #1f2937;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .action-btn:hover { background: #30363d; color: #c9d1d9; }
+  .action-btn:disabled { opacity: 0.5; cursor: wait; }
+  .action-btn.pull-btn { border-color: #db61a2; color: #f778ba; }
+  .action-btn.pull-btn:hover { background: #290a1f; }
+  .action-btn.push-btn { border-color: #1f6feb; color: #58a6ff; }
+  .action-btn.push-btn:hover { background: #0a1929; }
+  .action-btn.ai-btn { border-color: #8957e5; color: #bc8cff; }
+  .action-btn.ai-btn:hover { background: #1a0a2e; }
+  .commit-msg-modal .modal { border-color: #1f6feb; max-width: 560px; }
+  .commit-msg-modal .modal h2 { color: #58a6ff; }
+  .commit-msg-pre {
+    background: #0d1117;
+    padding: 12px;
+    border-radius: 6px;
+    font-size: 13px;
+    white-space: pre-wrap;
+    margin: 12px 0;
+    max-height: 300px;
+    overflow: auto;
+    color: #c9d1d9;
+    font-family: monospace;
+    border: 1px solid #21262d;
+    cursor: text;
+    user-select: all;
+  }
+  .header-ai-btn {
+    background: #1a0a2e;
+    border-color: #8957e5;
+    color: #bc8cff;
+  }
+  .header-ai-btn:hover { background: #2a1a3e; }
 </style>
 </head>
 <body>
@@ -448,6 +537,8 @@ function renderHTML(): string {
   <h1><img src="/favicon.jpg" alt="" style="width:32px;height:32px;border-radius:6px;vertical-align:middle;margin-right:10px;">Git Status Dashboard</h1>
   <div class="header-right">
     <span class="summary" id="summary"></span>
+    <button onclick="pullAll()" id="pullAllBtn" style="display:none">⬇ Pull All Safe</button>
+    <button onclick="aiTriage()" id="triageBtn" class="header-ai-btn" style="display:none">🤖 What needs attention?</button>
     <button onclick="refresh()" id="refreshBtn">Refresh</button>
     <select id="autoRefreshSelect" onchange="setAutoRefresh(this.value)" title="Auto-refresh interval">
       <option value="0">Auto: Off</option>
@@ -473,11 +564,34 @@ function renderHTML(): string {
     </div>
   </div>
 </div>
+<div class="modal-overlay commit-msg-modal" id="commitMsgModal">
+  <div class="modal">
+    <h2>🤖 AI Commit Message</h2>
+    <p id="commitMsgRepo" style="font-size:13px; margin-bottom:8px;"></p>
+    <pre class="commit-msg-pre" id="commitMsgText"></pre>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick="closeCommitMsgModal()">Close</button>
+      <button class="open-btn" onclick="copyCommitMsg()" id="copyCommitBtn">📋 Copy to Clipboard</button>
+    </div>
+  </div>
+</div>
 <div class="filter-bar" id="filters"></div>
 <div id="content"><div class="loading"><span class="spinner"></span>Scanning repositories...</div></div>
 <script>
 let allRepos = [];
 let activeFilter = "all";
+let aiAvailable = false;
+
+function daysSince(isoDate) {
+  if (!isoDate) return Infinity;
+  return Math.floor((Date.now() - new Date(isoDate).getTime()) / 86400000);
+}
+
+// Check AI availability on load
+fetch("/api/config").then(r => r.json()).then(c => {
+  aiAvailable = c.aiAvailable || false;
+  if (aiAvailable) document.getElementById("triageBtn").style.display = "";
+});
 
 async function openInVSCode(path) {
   await fetch("/api/open", {
@@ -513,6 +627,7 @@ function renderFilters(repos) {
   const pending = repos.filter(r => r.ahead > 0 || r.behind > 0).length;
   const noRemote = repos.filter(r => !r.hasRemote).length;
   const errors = repos.filter(r => r.error).length;
+  const stale = repos.filter(r => daysSince(r.lastCommitDate) >= 30).length;
 
   const filters = [
     { id: "all", label: "All", count: repos.length },
@@ -521,6 +636,7 @@ function renderFilters(repos) {
     { id: "clean", label: "Clean", count: clean },
     { id: "no-remote", label: "No Remote", count: noRemote },
   ];
+  if (stale > 0) filters.push({ id: "stale", label: "Stale (30d+)", count: stale });
   if (errors > 0) filters.push({ id: "error", label: "Errors", count: errors });
 
   document.getElementById("filters").innerHTML = filters
@@ -541,6 +657,7 @@ function filterRepos(repos) {
     case "pending": return repos.filter(r => r.ahead > 0 || r.behind > 0);
     case "clean": return repos.filter(r => !r.error && r.uncommitted === 0 && r.ahead === 0 && r.behind === 0);
     case "no-remote": return repos.filter(r => !r.hasRemote);
+    case "stale": return repos.filter(r => daysSince(r.lastCommitDate) >= 30);
     case "error": return repos.filter(r => r.error);
     default: return repos;
   }
@@ -554,10 +671,20 @@ function renderRepos(repos) {
   const dirty = repos.filter(r => r.uncommitted > 0).length;
   const needsPush = repos.filter(r => r.ahead > 0).length;
   const needsPull = repos.filter(r => r.behind > 0).length;
+  const safePullable = repos.filter(r => r.behind > 0 && r.uncommitted === 0 && !r.error).length;
   const showFolder = new Set(repos.map(r => r.folder)).size > 1;
 
   document.getElementById("summary").textContent =
     repos.length + " repos | " + dirty + " uncommitted | " + needsPush + " to push | " + needsPull + " to pull";
+
+  // Show/hide Pull All button
+  const pullAllBtn = document.getElementById("pullAllBtn");
+  if (safePullable > 0) {
+    pullAllBtn.style.display = "";
+    pullAllBtn.textContent = "⬇ Pull All Safe (" + safePullable + ")";
+  } else {
+    pullAllBtn.style.display = "none";
+  }
 
   if (filtered.length === 0) {
     document.getElementById("content").innerHTML =
@@ -565,9 +692,13 @@ function renderRepos(repos) {
     return;
   }
 
+  const esc = s => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+
   document.getElementById("content").innerHTML = '<div class="grid">' +
     filtered.map(repo => {
       const cls = getCardClass(repo);
+      const path = esc(repo.path);
+      const name = esc(repo.name);
       let badges = "";
 
       if (repo.error) {
@@ -591,24 +722,49 @@ function renderRepos(repos) {
         if (repo.detached) {
           badges += '<span class="badge badge-detached">Detached HEAD</span>';
         }
+        const days = daysSince(repo.lastCommitDate);
+        if (days >= 30) {
+          badges += '<span class="badge badge-stale">Stale (' + days + 'd)</span>';
+        }
       }
 
       const folderLabel = showFolder
         ? '<div class="folder-label">📁 ' + repo.folder.split('/').pop() + '</div>'
         : '';
 
+      // Last commit line
+      let lastCommitLine = '';
+      if (repo.lastCommitDate) {
+        const days = daysSince(repo.lastCommitDate);
+        const ago = days === 0 ? 'today' : days === 1 ? 'yesterday' : days + ' days ago';
+        lastCommitLine = '<div class="last-commit">Last commit: ' + ago + '</div>';
+      }
+
+      // Action buttons
+      let actions = '<button class="open-btn" data-path="' + path + '" onclick="openInVSCode(this.dataset.path)">Open in VS Code</button>' +
+        '<button class="open-btn" data-path="' + path + '" onclick="revealInFinder(this.dataset.path)">Reveal in Finder</button>';
+
+      if (repo.behind > 0) {
+        actions += '<button class="action-btn pull-btn" data-path="' + path + '" onclick="pullRepo(this)">⬇ Pull</button>';
+      }
+      if (repo.ahead > 0) {
+        actions += '<button class="action-btn push-btn" data-path="' + path + '" onclick="pushRepo(this)">⬆ Push</button>';
+      }
+      if (repo.uncommitted > 0 && aiAvailable) {
+        actions += '<button class="action-btn ai-btn" data-path="' + path + '" data-name="' + name + '" onclick="generateCommitMsg(this)">🤖 AI Commit Msg</button>';
+      }
+
+      actions += '<button class="delete-btn" data-path="' + path + '" data-name="' + name + '" onclick="openDeleteModal(this.dataset.path, this.dataset.name)">Delete</button>';
+
       return '<div class="card ' + cls + '">' +
         folderLabel +
         '<div class="card-header">' +
-          '<span class="repo-name">' + repo.name + '</span>' +
+          '<span class="repo-name">' + name + '</span>' +
           '<span class="branch">' + (repo.branch || "?") + '</span>' +
         '</div>' +
         '<div class="badges">' + badges + '</div>' +
-        '<div class="card-actions">' +
-          '<button class="open-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="openInVSCode(this.dataset.path)">Open in VS Code</button>' +
-          '<button class="open-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="revealInFinder(this.dataset.path)">Reveal in Finder</button>' +
-          '<button class="delete-btn" data-path="' + repo.path.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" data-name="' + repo.name.replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '" onclick="openDeleteModal(this.dataset.path, this.dataset.name)">Delete</button>' +
-        '</div>' +
+        lastCommitLine +
+        '<div class="card-actions">' + actions + '</div>' +
       '</div>';
     }).join("") +
   '</div>';
@@ -640,6 +796,148 @@ function showBanner(msg, type) {
 
 function hideBanner() {
   document.getElementById("statusBanner").style.display = "none";
+}
+
+async function pullRepo(btn) {
+  const path = btn.dataset.path;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Pulling...";
+  try {
+    const res = await fetch("/api/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showBanner("Pull successful: " + (data.output || "Up to date"), "success");
+      refresh();
+    } else {
+      showBanner("Pull failed: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("Pull failed: " + e.message, "");
+  }
+  btn.disabled = false;
+  btn.textContent = orig;
+}
+
+async function pushRepo(btn) {
+  const path = btn.dataset.path;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Pushing...";
+  try {
+    const res = await fetch("/api/push", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showBanner("Push successful" + (data.output ? ": " + data.output : ""), "success");
+      refresh();
+    } else {
+      showBanner("Push failed: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("Push failed: " + e.message, "");
+  }
+  btn.disabled = false;
+  btn.textContent = orig;
+}
+
+async function pullAll() {
+  const btn = document.getElementById("pullAllBtn");
+  btn.disabled = true;
+  btn.textContent = "⬇ Pulling...";
+  showBanner("Pulling all safe repos...", "info");
+  try {
+    const res = await fetch("/api/pull-all", { method: "POST" });
+    const data = await res.json();
+    const ok = data.results.filter(r => r.ok).length;
+    const fail = data.results.filter(r => !r.ok).length;
+    let msg = "Pull All: " + ok + "/" + data.total + " succeeded";
+    if (fail > 0) {
+      msg += "\\n\\nFailed:\\n" + data.results.filter(r => !r.ok).map(r => "  " + r.repo + ": " + r.error).join("\\n");
+      showBanner(msg, "warn");
+    } else {
+      showBanner(msg, "success");
+    }
+    refresh();
+  } catch (e) {
+    showBanner("Pull All failed: " + e.message, "");
+  }
+  btn.disabled = false;
+}
+
+async function generateCommitMsg(btn) {
+  const path = btn.dataset.path;
+  const name = btn.dataset.name;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "🤖 Generating...";
+  try {
+    const res = await fetch("/api/ai-commit-msg", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      document.getElementById("commitMsgRepo").textContent = name + " (" + path + ")";
+      document.getElementById("commitMsgText").textContent = data.message;
+      document.getElementById("copyCommitBtn").textContent = "📋 Copy to Clipboard";
+      document.getElementById("commitMsgModal").classList.add("visible");
+    } else {
+      showBanner("AI Commit Msg failed: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("AI Commit Msg failed: " + e.message, "");
+  }
+  btn.disabled = false;
+  btn.textContent = orig;
+}
+
+function closeCommitMsgModal() {
+  document.getElementById("commitMsgModal").classList.remove("visible");
+}
+
+async function copyCommitMsg() {
+  const text = document.getElementById("commitMsgText").textContent;
+  try {
+    await navigator.clipboard.writeText(text);
+    const btn = document.getElementById("copyCommitBtn");
+    btn.textContent = "✓ Copied!";
+    setTimeout(() => { btn.textContent = "📋 Copy to Clipboard"; }, 2000);
+  } catch {
+    showBanner("Failed to copy — select the text manually", "");
+  }
+}
+
+document.getElementById("commitMsgModal").addEventListener("click", function(e) {
+  if (e.target === this) closeCommitMsgModal();
+});
+
+async function aiTriage() {
+  const btn = document.getElementById("triageBtn");
+  btn.disabled = true;
+  btn.textContent = "🤖 Analyzing...";
+  showBanner("Running AI triage analysis...", "info");
+  try {
+    const res = await fetch("/api/ai-triage", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showBanner(data.triage, "info");
+    } else {
+      showBanner("AI Triage failed: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("AI Triage failed: " + e.message, "");
+  }
+  btn.disabled = false;
+  btn.textContent = "🤖 What needs attention?";
 }
 
 async function updateServer() {
@@ -765,6 +1063,8 @@ refresh();
 
 async function main() {
   const config = await loadConfig();
+  AI_AVAILABLE = await checkAIAvailable();
+  log(`AI available: ${AI_AVAILABLE}${AI_AVAILABLE ? ` (${INFERENCE_PATH})` : ""}`);
   const cachedHTML = renderHTML();
 
   const server = Bun.serve({
@@ -775,41 +1075,120 @@ async function main() {
 
       if (url.pathname === "/api/open" && req.method === "POST") {
         const body = await req.json();
-        const rawPath = body.path;
-        if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
-          return Response.json({ error: "Invalid path" }, { status: 400 });
-        }
-        const resolved = resolve(rawPath);
-        const allowed = config.projectDirs.some(
-          (dir) => resolved.startsWith(resolve(dir) + "/"),
-        );
-        if (!allowed) {
-          return Response.json({ error: "Path not in configured directories" }, { status: 403 });
-        }
-        const proc = Bun.spawn(["code", resolved], { stdout: "ignore", stderr: "ignore" });
+        const v = validateRepoPath(body.path, config);
+        if ("error" in v) return Response.json({ error: v.error }, { status: v.status });
+        const proc = Bun.spawn(["code", v.resolved], { stdout: "ignore", stderr: "ignore" });
         await proc.exited;
         return Response.json({ ok: true });
       }
 
       if (url.pathname === "/api/reveal" && req.method === "POST") {
         const body = await req.json();
-        const rawPath = body.path;
-        if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
-          return Response.json({ error: "Invalid path" }, { status: 400 });
-        }
-        const resolved = resolve(rawPath);
-        const allowed = config.projectDirs.some(
-          (dir) => resolved.startsWith(resolve(dir) + "/"),
-        );
-        if (!allowed) {
-          return Response.json({ error: "Path not in configured directories" }, { status: 403 });
-        }
+        const v = validateRepoPath(body.path, config);
+        if ("error" in v) return Response.json({ error: v.error }, { status: v.status });
         const cmd = process.platform === "win32"
-          ? ["explorer", `/select,${resolved}`]
-          : ["open", "-R", resolved];
+          ? ["explorer", `/select,${v.resolved}`]
+          : ["open", "-R", v.resolved];
         const proc = Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore" });
         await proc.exited;
         return Response.json({ ok: true });
+      }
+
+      if (url.pathname === "/api/pull" && req.method === "POST") {
+        const body = await req.json();
+        const v = validateRepoPath(body.path, config);
+        if ("error" in v) return Response.json({ error: v.error }, { status: v.status });
+        try {
+          const output = await runGit(v.resolved, ["pull"]);
+          log(`Pull ${v.resolved}: ${output}`);
+          return Response.json({ ok: true, output });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/push" && req.method === "POST") {
+        const body = await req.json();
+        const v = validateRepoPath(body.path, config);
+        if ("error" in v) return Response.json({ error: v.error }, { status: v.status });
+        try {
+          const output = await runGit(v.resolved, ["push"]);
+          log(`Push ${v.resolved}: ${output}`);
+          return Response.json({ ok: true, output });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/pull-all" && req.method === "POST") {
+        log("Pull-all requested — scanning for safe repos...");
+        const repos = await getGitRepos(config);
+        const statuses = await pMap(repos, (r, i) => getRepoStatus(r, i, repos.length), 8);
+        const pullable = statuses.filter(s => s.behind > 0 && s.uncommitted === 0 && !s.error);
+        log(`Pull-all: ${pullable.length} repos eligible`);
+        const results = await pMap(pullable, async (s) => {
+          try {
+            const output = await runGit(s.path, ["pull"]);
+            log(`  Pull-all ${s.name}: ${output}`);
+            return { repo: s.name, ok: true, output };
+          } catch (e: any) {
+            return { repo: s.name, ok: false, error: e.message };
+          }
+        }, 4);
+        return Response.json({ results, total: pullable.length });
+      }
+
+      if (url.pathname === "/api/ai-commit-msg" && req.method === "POST") {
+        if (!AI_AVAILABLE) {
+          return Response.json({ error: "AI not available (Inference.ts not found)" }, { status: 503 });
+        }
+        const body = await req.json();
+        const v = validateRepoPath(body.path, config);
+        if ("error" in v) return Response.json({ error: v.error }, { status: v.status });
+        try {
+          const staged = await runGit(v.resolved, ["diff", "--staged"]);
+          const diff = staged || await runGit(v.resolved, ["diff", "HEAD"]);
+          if (!diff) {
+            return Response.json({ error: "No changes to generate message for" }, { status: 400 });
+          }
+          const maxLen = 8000;
+          const truncated = diff.length > maxLen
+            ? diff.slice(0, maxLen) + "\n\n... [diff truncated]"
+            : diff;
+          const systemPrompt = "You are a git commit message generator. Output ONLY the commit message, nothing else. Use conventional commit format (feat:, fix:, refactor:, docs:, chore:, etc). First line max 72 chars. Add body paragraph if the change is non-trivial.";
+          const userPrompt = "Generate a commit message for this diff:\n\n" + truncated;
+          const message = await runInference(systemPrompt, userPrompt);
+          return Response.json({ ok: true, message });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 500 });
+        }
+      }
+
+      if (url.pathname === "/api/ai-triage" && req.method === "POST") {
+        if (!AI_AVAILABLE) {
+          return Response.json({ error: "AI not available (Inference.ts not found)" }, { status: 503 });
+        }
+        try {
+          const repos = await getGitRepos(config);
+          const statuses = await pMap(repos, (r, i) => getRepoStatus(r, i, repos.length), 8);
+          const actionable = statuses.filter(s =>
+            s.uncommitted > 0 || s.ahead > 0 || s.behind > 0 || s.error || !s.hasRemote
+          );
+          if (actionable.length === 0) {
+            return Response.json({ ok: true, triage: "✅ All repos are clean — nothing needs attention!", repoCount: 0 });
+          }
+          const summary = JSON.stringify(actionable.map(s => ({
+            name: s.name, branch: s.branch, uncommitted: s.uncommitted,
+            ahead: s.ahead, behind: s.behind, hasRemote: s.hasRemote,
+            error: s.error, lastCommitDate: s.lastCommitDate,
+          })));
+          const systemPrompt = "You are a git repository triage assistant. Given a JSON array of repos needing attention, output a SHORT prioritized action list. Group by urgency. Use emoji prefixes: 🔴 urgent (errors, conflicts), 🟡 action needed (uncommitted changes, push/pull), 🔵 informational (no remote, stale). Be concise — one line per repo.";
+          const userPrompt = "Triage these repos:\n" + summary;
+          const triage = await runInference(systemPrompt, userPrompt);
+          return Response.json({ ok: true, triage, repoCount: actionable.length });
+        } catch (e: any) {
+          return Response.json({ error: e.message }, { status: 500 });
+        }
       }
 
       if (url.pathname === "/api/repos" && req.method === "GET") {
@@ -827,7 +1206,7 @@ async function main() {
       }
 
       if (url.pathname === "/api/config") {
-        return Response.json({ projectDirs: config.projectDirs });
+        return Response.json({ projectDirs: config.projectDirs, aiAvailable: AI_AVAILABLE });
       }
 
       if (url.pathname === "/api/update" && req.method === "POST") {
@@ -851,32 +1230,23 @@ async function main() {
 
       if (url.pathname === "/api/delete" && req.method === "POST") {
         const body = await req.json();
-        const rawPath = body.path;
-        if (!rawPath || typeof rawPath !== "string" || rawPath.includes("..")) {
-          return Response.json({ error: "Invalid path" }, { status: 400 });
-        }
-        const resolved = resolve(rawPath);
-        const allowed = config.projectDirs.some(
-          (dir) => resolved.startsWith(resolve(dir) + "/"),
-        );
-        if (!allowed) {
-          return Response.json({ error: "Path not in configured directories" }, { status: 403 });
-        }
+        const v = validateRepoPath(body.path, config);
+        if ("error" in v) return Response.json({ error: v.error }, { status: v.status });
         // Must be a git repo
-        const gitDir = join(resolved, ".git");
+        const gitDir = join(v.resolved, ".git");
         try {
           await stat(gitDir);
         } catch {
           return Response.json({ error: "Not a git repository" }, { status: 400 });
         }
-        const proc = Bun.spawn(["rm", "-rf", resolved], { stdout: "ignore", stderr: "pipe" });
+        const proc = Bun.spawn(["rm", "-rf", v.resolved], { stdout: "ignore", stderr: "pipe" });
         const errText = await new Response(proc.stderr).text();
         await proc.exited;
         if (errText.trim()) {
-          log(`Delete error for ${resolved}: ${errText}`);
+          log(`Delete error for ${v.resolved}: ${errText}`);
           return Response.json({ error: errText.trim() }, { status: 500 });
         }
-        log(`Deleted repo: ${resolved}`);
+        log(`Deleted repo: ${v.resolved}`);
         return Response.json({ ok: true });
       }
 
