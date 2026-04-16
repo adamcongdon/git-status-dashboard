@@ -4,3 +4,4 @@ config.json
 # Bun
 node_modules/
 bun.lockb
+.DS_Store

@@ -144,10 +144,15 @@ async function checkAIAvailable(): Promise<boolean> {
 }
 
 async function runInference(systemPrompt: string, userPrompt: string, timeoutMs = 30000): Promise<string> {
+  const inferenceEnv = { ...process.env };
+  // Ensure claude CLI is discoverable even when server was launched from a restricted PATH
+  if (!inferenceEnv.PATH?.includes("/opt/homebrew/bin")) {
+    inferenceEnv.PATH = `${inferenceEnv.PATH || ""}:/opt/homebrew/bin:/usr/local/bin`;
+  }
   const proc = Bun.spawn(["bun", INFERENCE_PATH, "--level", "fast", systemPrompt, userPrompt], {
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env },
+    env: inferenceEnv,
   });
 
   const textPromise = new Response(proc.stdout).text();
