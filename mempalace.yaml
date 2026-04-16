@@ -1,8 +1,0 @@
-wing: git_status_dashboard
-rooms:
-- name: plans
-  description: Files from Plans/
-- name: auto_run_docs
-  description: Files from Auto Run Docs/
-- name: general
-  description: Files that don't fit other rooms

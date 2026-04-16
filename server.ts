@@ -16,6 +16,7 @@ function dbg(...args: unknown[]) {
 
 interface Config {
   projectDirs: string[];
+  ignoredRepos: string[];
 }
 
 interface RepoInfo {
@@ -36,7 +37,7 @@ async function loadConfig(): Promise<Config> {
     const raw = await readFile(CONFIG_PATH, "utf-8");
     const parsed = JSON.parse(raw);
     if (Array.isArray(parsed.projectDirs) && parsed.projectDirs.length > 0) {
-      return parsed as Config;
+      return { ...parsed, ignoredRepos: parsed.ignoredRepos || [] } as Config;
     }
   } catch {
     // config missing or invalid
@@ -60,7 +61,7 @@ async function runSetup(): Promise<Config> {
           .map((d) => expandHome(d.trim()))
           .filter((d) => d.length > 0);
 
-  const config: Config = { projectDirs: dirs };
+  const config: Config = { projectDirs: dirs, ignoredRepos: [] };
   await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
   console.log(`\nConfig saved to ${CONFIG_PATH}`);
   console.log(`Scanning directories: ${dirs.join(", ")}\n`);
@@ -102,7 +103,17 @@ async function getGitRepos(config: Config): Promise<RepoInfo[]> {
     log(`  Found ${repos.length} git repos in ${resolvedDir}`);
   }
 
-  return repos.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  const ignored = new Set(config.ignoredRepos.map(p => resolve(p)));
+  const filtered = repos.filter(r => !ignored.has(r.path));
+  return filtered.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+}
+
+interface BranchInfo {
+  name: string;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  gone: boolean;
 }
 
 interface RepoStatus {
@@ -116,6 +127,7 @@ interface RepoStatus {
   hasRemote: boolean;
   detached: boolean;
   lastCommitDate: string;
+  branches: BranchInfo[];
   error?: string;
 }
 
@@ -223,15 +235,17 @@ async function getRepoStatus(repo: RepoInfo, index: number, total: number): Prom
     hasRemote: false,
     detached: false,
     lastCommitDate: "",
+    branches: [],
   };
 
   try {
     // Run independent git commands in parallel
-    const [branch, porcelain, remotes, lastLog] = await Promise.all([
+    const [branch, porcelain, remotes, lastLog, branchRefs] = await Promise.all([
       runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]),
       runGit(repoPath, ["status", "--porcelain"]),
       runGit(repoPath, ["remote"]),
       runGit(repoPath, ["log", "-1", "--format=%aI"]).catch(() => ""),
+      runGit(repoPath, ["for-each-ref", "--format=%(refname:short)|%(upstream:short)|%(upstream:track)", "refs/heads/"]).catch(() => ""),
     ]);
 
     status.branch = branch;
@@ -263,6 +277,25 @@ async function getRepoStatus(repo: RepoInfo, index: number, total: number): Prom
         }
       } catch {
         // No upstream tracking branch
+      }
+    }
+
+    // Parse branch tracking info (all branches, not just current)
+    if (branchRefs) {
+      for (const line of branchRefs.split("\n")) {
+        if (!line) continue;
+        const [name, upstream, ...trackParts] = line.split("|");
+        const track = trackParts.join("|"); // rejoin in case track contains |
+        const info: BranchInfo = { name, upstream: upstream || "", ahead: 0, behind: 0, gone: false };
+        if (track === "[gone]") {
+          info.gone = true;
+        } else if (track) {
+          const aheadMatch = track.match(/ahead (\d+)/);
+          const behindMatch = track.match(/behind (\d+)/);
+          if (aheadMatch) info.ahead = parseInt(aheadMatch[1], 10);
+          if (behindMatch) info.behind = parseInt(behindMatch[1], 10);
+        }
+        status.branches.push(info);
       }
     }
   } catch (e: any) {
@@ -377,6 +410,18 @@ function renderHTML(): string {
   .badge-detached { background: #2a1500; color: #d29922; border: 1px solid #9e6a03; }
   .badge-error { background: #2d0000; color: #f85149; border: 1px solid #da3633; }
   .badge-stale { background: #1f1f1f; color: #8b949e; border: 1px solid #484f58; }
+  .badge-branch-issues { background: #1a1030; color: #bc8cff; border: 1px solid #8957e5; cursor: pointer; }
+  .badge-branch-issues:hover { background: #271d3d; }
+  .branch-detail { display: none; margin-top: 6px; font-size: 11px; color: #8b949e; border-top: 1px solid #30363d; padding-top: 6px; }
+  .branch-detail.open { display: block; }
+  .branch-detail-row { display: flex; justify-content: space-between; align-items: center; padding: 2px 0; }
+  .branch-detail-row .br-name { color: #c9d1d9; font-family: monospace; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%; }
+  .branch-detail-row .br-status { font-size: 10px; white-space: nowrap; }
+  .br-tag { display: inline-block; padding: 1px 5px; border-radius: 3px; margin-left: 3px; font-size: 10px; }
+  .br-tag.unpushed { background: #0d2818; color: #3fb950; }
+  .br-tag.no-upstream { background: #1f1f1f; color: #8b949e; }
+  .br-tag.gone { background: #2d0000; color: #f85149; }
+  .br-tag.behind { background: #290a1f; color: #f778ba; }
   .last-commit { font-size: 11px; color: #484f58; margin-top: 6px; }
   .card.clean { border-left: 3px solid #238636; }
   .card.dirty { border-left: 3px solid #d29922; }
@@ -529,6 +574,32 @@ function renderHTML(): string {
     cursor: text;
     user-select: all;
   }
+  .ignore-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+    background: transparent;
+    border: 1px solid #484f58;
+    color: #8b949e;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-left: auto;
+    transition: background 0.15s, color 0.15s;
+  }
+  .ignore-btn:hover { background: #1f1f1f; color: #c9d1d9; }
+  .card.ignored { opacity: 0.5; border-left: 3px solid #484f58; }
+  .badge-ignored { background: #1f1f1f; color: #8b949e; border: 1px solid #484f58; }
+  .unignore-btn {
+    font-size: 12px;
+    padding: 4px 10px;
+    background: transparent;
+    border: 1px solid #238636;
+    color: #3fb950;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-left: auto;
+    transition: background 0.15s, color 0.15s;
+  }
+  .unignore-btn:hover { background: #0d1f0d; }
   .header-ai-btn {
     background: #1a0a2e;
     border-color: #8957e5;
@@ -553,6 +624,7 @@ function renderHTML(): string {
       <option value="900">Auto: 15m</option>
       <option value="1800">Auto: 30m</option>
     </select>
+    <button onclick="showIgnored()" id="ignoredBtn" style="display:none">👁 Ignored (0)</button>
     <button onclick="updateServer()" id="updateBtn">Check for Updates</button>
     <button onclick="restartServer()" id="restartBtn">Restart Server</button>
   </div>
@@ -586,16 +658,20 @@ function renderHTML(): string {
 let allRepos = [];
 let activeFilter = "all";
 let aiAvailable = false;
+let ignoredRepos = [];
+let showingIgnored = false;
 
 function daysSince(isoDate) {
   if (!isoDate) return Infinity;
   return Math.floor((Date.now() - new Date(isoDate).getTime()) / 86400000);
 }
 
-// Check AI availability on load
+// Check AI availability and ignored repos on load
 fetch("/api/config").then(r => r.json()).then(c => {
   aiAvailable = c.aiAvailable || false;
+  ignoredRepos = c.ignoredRepos || [];
   if (aiAvailable) document.getElementById("triageBtn").style.display = "";
+  updateIgnoredBtn();
 });
 
 async function openInVSCode(path) {
@@ -626,6 +702,15 @@ function getCardClass(repo) {
   return "clean";
 }
 
+function branchIssues(repo) {
+  if (!repo.branches || repo.branches.length <= 1) return [];
+  return repo.branches.filter(b => b.name !== repo.branch && (b.ahead > 0 || !b.upstream || b.gone));
+}
+
+function hasBranchIssues(repo) {
+  return branchIssues(repo).length > 0;
+}
+
 function renderFilters(repos) {
   const clean = repos.filter(r => !r.error && r.uncommitted === 0 && r.ahead === 0 && r.behind === 0).length;
   const dirty = repos.filter(r => r.uncommitted > 0).length;
@@ -633,6 +718,7 @@ function renderFilters(repos) {
   const noRemote = repos.filter(r => !r.hasRemote).length;
   const errors = repos.filter(r => r.error).length;
   const stale = repos.filter(r => daysSince(r.lastCommitDate) >= 30).length;
+  const branchIssueCount = repos.filter(r => hasBranchIssues(r)).length;
 
   const filters = [
     { id: "all", label: "All", count: repos.length },
@@ -641,6 +727,7 @@ function renderFilters(repos) {
     { id: "clean", label: "Clean", count: clean },
     { id: "no-remote", label: "No Remote", count: noRemote },
   ];
+  if (branchIssueCount > 0) filters.push({ id: "branch-issues", label: "Branch Issues", count: branchIssueCount });
   if (stale > 0) filters.push({ id: "stale", label: "Stale (30d+)", count: stale });
   if (errors > 0) filters.push({ id: "error", label: "Errors", count: errors });
 
@@ -662,6 +749,7 @@ function filterRepos(repos) {
     case "pending": return repos.filter(r => r.ahead > 0 || r.behind > 0);
     case "clean": return repos.filter(r => !r.error && r.uncommitted === 0 && r.ahead === 0 && r.behind === 0);
     case "no-remote": return repos.filter(r => !r.hasRemote);
+    case "branch-issues": return repos.filter(r => hasBranchIssues(r));
     case "stale": return repos.filter(r => daysSince(r.lastCommitDate) >= 30);
     case "error": return repos.filter(r => r.error);
     default: return repos;
@@ -679,8 +767,10 @@ function renderRepos(repos) {
   const safePullable = repos.filter(r => r.behind > 0 && r.uncommitted === 0 && !r.error).length;
   const showFolder = new Set(repos.map(r => r.folder)).size > 1;
 
-  document.getElementById("summary").textContent =
-    repos.length + " repos | " + dirty + " uncommitted | " + needsPush + " to push | " + needsPull + " to pull";
+  const branchIssueTotal = repos.filter(r => hasBranchIssues(r)).length;
+  let summaryText = repos.length + " repos | " + dirty + " uncommitted | " + needsPush + " to push | " + needsPull + " to pull";
+  if (branchIssueTotal > 0) summaryText += " | " + branchIssueTotal + " branch issues";
+  document.getElementById("summary").textContent = summaryText;
 
   // Show/hide Pull All button
   const pullAllBtn = document.getElementById("pullAllBtn");
@@ -733,6 +823,28 @@ function renderRepos(repos) {
         }
       }
 
+      // Branch issues badge
+      const issues = branchIssues(repo);
+      const cardId = 'br-' + name.replace(/[^a-zA-Z0-9]/g, '-');
+      if (issues.length > 0) {
+        badges += '<span class="badge badge-branch-issues" onclick="document.getElementById(\\'' + cardId + '\\').classList.toggle(\\'open\\')">' + issues.length + ' branch issue' + (issues.length > 1 ? 's' : '') + '</span>';
+      }
+
+      // Branch detail panel
+      let branchDetail = '';
+      if (issues.length > 0) {
+        branchDetail = '<div class="branch-detail" id="' + cardId + '">' +
+          issues.map(b => {
+            let tags = '';
+            if (b.gone) tags += '<span class="br-tag gone">upstream gone</span>';
+            else if (!b.upstream) tags += '<span class="br-tag no-upstream">no upstream</span>';
+            if (b.ahead > 0) tags += '<span class="br-tag unpushed">' + b.ahead + ' unpushed</span>';
+            if (b.behind > 0) tags += '<span class="br-tag behind">' + b.behind + ' behind</span>';
+            return '<div class="branch-detail-row"><span class="br-name">' + esc(b.name) + '</span><span class="br-status">' + tags + '</span></div>';
+          }).join('') +
+        '</div>';
+      }
+
       const folderLabel = showFolder
         ? '<div class="folder-label">📁 ' + repo.folder.split('/').pop() + '</div>'
         : '';
@@ -759,6 +871,7 @@ function renderRepos(repos) {
         actions += '<button class="action-btn ai-btn" data-path="' + path + '" data-name="' + name + '" onclick="generateCommitMsg(this)">🤖 AI Commit Msg</button>';
       }
 
+      actions += '<button class="ignore-btn" data-path="' + path + '" onclick="ignoreRepo(this.dataset.path)">Ignore</button>';
       actions += '<button class="delete-btn" data-path="' + path + '" data-name="' + name + '" onclick="openDeleteModal(this.dataset.path, this.dataset.name)">Delete</button>';
 
       return '<div class="card ' + cls + '">' +
@@ -768,6 +881,7 @@ function renderRepos(repos) {
           '<span class="branch">' + (repo.branch || "?") + '</span>' +
         '</div>' +
         '<div class="badges">' + badges + '</div>' +
+        branchDetail +
         lastCommitLine +
         '<div class="card-actions">' + actions + '</div>' +
       '</div>';
@@ -945,6 +1059,95 @@ async function aiTriage() {
   btn.textContent = "🤖 What needs attention?";
 }
 
+function updateIgnoredBtn() {
+  const btn = document.getElementById("ignoredBtn");
+  if (ignoredRepos.length > 0) {
+    btn.style.display = "";
+    btn.textContent = showingIgnored ? "👁 Hide Ignored (" + ignoredRepos.length + ")" : "👁 Ignored (" + ignoredRepos.length + ")";
+  } else {
+    btn.style.display = "none";
+    showingIgnored = false;
+  }
+}
+
+async function ignoreRepo(path) {
+  try {
+    const res = await fetch("/api/ignore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      ignoredRepos = data.ignoredRepos;
+      updateIgnoredBtn();
+      showBanner("Repository ignored. It won't appear in scans.", "success");
+      refresh();
+    } else {
+      showBanner("Failed to ignore: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("Failed to ignore: " + e.message, "");
+  }
+}
+
+async function unignoreRepo(path) {
+  try {
+    const res = await fetch("/api/unignore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      ignoredRepos = data.ignoredRepos;
+      updateIgnoredBtn();
+      showBanner("Repository restored to dashboard.", "success");
+      if (showingIgnored) showIgnored();
+      else refresh();
+    } else {
+      showBanner("Failed to unignore: " + (data.error || "Unknown error"), "");
+    }
+  } catch (e) {
+    showBanner("Failed to unignore: " + e.message, "");
+  }
+}
+
+async function showIgnored() {
+  if (showingIgnored) {
+    showingIgnored = false;
+    updateIgnoredBtn();
+    refresh();
+    return;
+  }
+  showingIgnored = true;
+  updateIgnoredBtn();
+  const res = await fetch("/api/ignored");
+  const data = await res.json();
+  const repos = data.ignoredRepos || [];
+  if (repos.length === 0) {
+    document.getElementById("content").innerHTML = '<div class="loading">No ignored repositories.</div>';
+    return;
+  }
+  const esc = s => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  document.getElementById("filters").innerHTML = '<button class="filter-btn active">Ignored Repos</button>';
+  document.getElementById("content").innerHTML = '<div class="grid">' +
+    repos.map(path => {
+      const name = path.split("/").pop();
+      return '<div class="card ignored">' +
+        '<div class="card-header">' +
+          '<span class="repo-name">' + esc(name) + '</span>' +
+          '<span class="badge badge-ignored">Ignored</span>' +
+        '</div>' +
+        '<div style="font-size:12px; color:#484f58; margin-bottom:8px; font-family:monospace;">' + esc(path) + '</div>' +
+        '<div class="card-actions">' +
+          '<button class="unignore-btn" onclick="unignoreRepo(\\'' + esc(path) + '\\')">Restore to Dashboard</button>' +
+        '</div>' +
+      '</div>';
+    }).join("") +
+  '</div>';
+}
+
 async function updateServer() {
   const btn = document.getElementById("updateBtn");
   btn.disabled = true;
@@ -1067,7 +1270,7 @@ refresh();
 }
 
 async function main() {
-  const config = await loadConfig();
+  let config = await loadConfig();
   AI_AVAILABLE = await checkAIAvailable();
   log(`AI available: ${AI_AVAILABLE}${AI_AVAILABLE ? ` (${INFERENCE_PATH})` : ""}`);
   const cachedHTML = renderHTML();
@@ -1196,6 +1399,38 @@ async function main() {
         }
       }
 
+      if (url.pathname === "/api/ignore" && req.method === "POST") {
+        const body = await req.json();
+        const rawPath = body.path;
+        if (!rawPath || typeof rawPath !== "string") {
+          return Response.json({ error: "Invalid path" }, { status: 400 });
+        }
+        const resolved = resolve(rawPath);
+        if (!config.ignoredRepos.includes(resolved)) {
+          config.ignoredRepos.push(resolved);
+          await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+          log(`Ignored repo: ${resolved}`);
+        }
+        return Response.json({ ok: true, ignoredRepos: config.ignoredRepos });
+      }
+
+      if (url.pathname === "/api/unignore" && req.method === "POST") {
+        const body = await req.json();
+        const rawPath = body.path;
+        if (!rawPath || typeof rawPath !== "string") {
+          return Response.json({ error: "Invalid path" }, { status: 400 });
+        }
+        const resolved = resolve(rawPath);
+        config.ignoredRepos = config.ignoredRepos.filter(p => resolve(p) !== resolved);
+        await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+        log(`Unignored repo: ${resolved}`);
+        return Response.json({ ok: true, ignoredRepos: config.ignoredRepos });
+      }
+
+      if (url.pathname === "/api/ignored" && req.method === "GET") {
+        return Response.json({ ignoredRepos: config.ignoredRepos });
+      }
+
       if (url.pathname === "/api/repos" && req.method === "GET") {
         const t0 = performance.now();
         log(`Scan requested. Dirs: ${config.projectDirs.join(", ")}`);
@@ -1211,7 +1446,7 @@ async function main() {
       }
 
       if (url.pathname === "/api/config") {
-        return Response.json({ projectDirs: config.projectDirs, aiAvailable: AI_AVAILABLE });
+        return Response.json({ projectDirs: config.projectDirs, aiAvailable: AI_AVAILABLE, ignoredRepos: config.ignoredRepos });
       }
 
       if (url.pathname === "/api/update" && req.method === "POST") {
