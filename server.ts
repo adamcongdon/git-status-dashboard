@@ -128,6 +128,7 @@ interface RepoStatus {
   detached: boolean;
   lastCommitDate: string;
   branches: BranchInfo[];
+  remoteUrl: string;
   error?: string;
 }
 
@@ -236,16 +237,18 @@ async function getRepoStatus(repo: RepoInfo, index: number, total: number): Prom
     detached: false,
     lastCommitDate: "",
     branches: [],
+    remoteUrl: "",
   };
 
   try {
     // Run independent git commands in parallel
-    const [branch, porcelain, remotes, lastLog, branchRefs] = await Promise.all([
+    const [branch, porcelain, remotes, lastLog, branchRefs, remoteUrl] = await Promise.all([
       runGit(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]),
       runGit(repoPath, ["status", "--porcelain"]),
       runGit(repoPath, ["remote"]),
       runGit(repoPath, ["log", "-1", "--format=%aI"]).catch(() => ""),
       runGit(repoPath, ["for-each-ref", "--format=%(refname:short)|%(upstream:short)|%(upstream:track)", "refs/heads/"]).catch(() => ""),
+      runGit(repoPath, ["remote", "get-url", "origin"]).catch(() => ""),
     ]);
 
     status.branch = branch;
@@ -255,6 +258,7 @@ async function getRepoStatus(repo: RepoInfo, index: number, total: number): Prom
     status.uncommitted = porcelain ? porcelain.split("\n").length : 0;
     status.hasRemote = remotes.length > 0;
     status.lastCommitDate = lastLog;
+    status.remoteUrl = remoteUrl;
 
     // Ahead/behind (depends on branch and remote results)
     if (status.hasRemote && !status.detached) {
@@ -374,7 +378,7 @@ function renderHTML(): string {
     display: flex;
     align-items: center;
     justify-content: space-between;
-    margin-bottom: 10px;
+    margin-bottom: 12px;
   }
   .repo-name {
     font-size: 16px;
@@ -383,7 +387,7 @@ function renderHTML(): string {
   }
   .branch {
     font-size: 12px;
-    background: #1f2937;
+    background: #30363d;
     padding: 2px 8px;
     border-radius: 12px;
     color: #8b949e;
@@ -392,6 +396,7 @@ function renderHTML(): string {
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
+    margin-bottom: 12px;
   }
   .badge {
     font-size: 12px;
@@ -402,14 +407,11 @@ function renderHTML(): string {
     align-items: center;
     gap: 4px;
   }
-  .badge-clean { background: #0d1f0d; color: #3fb950; border: 1px solid #238636; }
   .badge-uncommitted { background: #2a1f00; color: #d29922; border: 1px solid #9e6a03; }
-  .badge-ahead { background: #0a1929; color: #58a6ff; border: 1px solid #1f6feb; }
-  .badge-behind { background: #290a1f; color: #f778ba; border: 1px solid #db61a2; }
+  .badge-sync { background: #2a1f00; color: #d29922; border: 1px solid #9e6a03; }
   .badge-no-remote { background: #1f1f1f; color: #8b949e; border: 1px solid #484f58; }
   .badge-detached { background: #2a1500; color: #d29922; border: 1px solid #9e6a03; }
   .badge-error { background: #2d0000; color: #f85149; border: 1px solid #da3633; }
-  .badge-stale { background: #1f1f1f; color: #8b949e; border: 1px solid #484f58; }
   .badge-branch-issues { background: #1a1030; color: #bc8cff; border: 1px solid #8957e5; cursor: pointer; }
   .badge-branch-issues:hover { background: #271d3d; }
   .branch-detail { display: none; margin-top: 6px; font-size: 11px; color: #8b949e; border-top: 1px solid #30363d; padding-top: 6px; }
@@ -422,7 +424,9 @@ function renderHTML(): string {
   .br-tag.no-upstream { background: #1f1f1f; color: #8b949e; }
   .br-tag.gone { background: #2d0000; color: #f85149; }
   .br-tag.behind { background: #290a1f; color: #f778ba; }
-  .last-commit { font-size: 11px; color: #484f58; margin-top: 6px; }
+  .last-commit { font-size: 11px; color: #8b949e; margin-top: 8px; }
+  .last-commit.stale-warn { color: #d29922; }
+  .last-commit.stale-danger { color: #f85149; }
   .card.clean { border-left: 3px solid #238636; }
   .card.dirty { border-left: 3px solid #d29922; }
   .card.pending { border-left: 3px solid #58a6ff; }
@@ -462,7 +466,6 @@ function renderHTML(): string {
   }
   .filter-btn.active { background: #1f6feb; color: #f0f6fc; border-color: #1f6feb; }
   .filter-btn .count { margin-left: 4px; opacity: 0.7; }
-  .card-actions { margin-top: 10px; display: flex; gap: 8px; }
   .open-btn {
     font-size: 12px;
     padding: 4px 10px;
@@ -479,9 +482,9 @@ function renderHTML(): string {
     background: #21262d;
     color: #8b949e;
     border: 1px solid #30363d;
-    padding: 7px 10px;
-    border-radius: 6px;
-    font-size: 13px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
     cursor: pointer;
   }
   #autoRefreshSelect.active { color: #58a6ff; border-color: #1f6feb; }
@@ -606,6 +609,141 @@ function renderHTML(): string {
     color: #bc8cff;
   }
   .header-ai-btn:hover { background: #2a1a3e; }
+  /* Icon buttons for VS Code, Finder, Website */
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    line-height: 1;
+    background: #1f2937;
+    border: 1px solid #30363d;
+    color: #8b949e;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .icon-btn:hover { background: #30363d; color: #c9d1d9; }
+  .icon-btn-row { display: flex; gap: 4px; align-items: center; }
+  /* Card overflow menu (three-dot) */
+  .card-overflow { position: relative; margin-left: auto; }
+  .card-overflow-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    line-height: 1;
+    background: transparent;
+    border: 1px solid transparent;
+    color: #484f58;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+  .card-overflow-btn:hover { background: #21262d; color: #8b949e; border-color: #30363d; }
+  .card-overflow-menu {
+    display: none;
+    position: absolute;
+    right: 0;
+    bottom: 100%;
+    margin-bottom: 4px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 4px 0;
+    min-width: 140px;
+    z-index: 50;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .card-overflow-menu.open { display: block; }
+  .card-overflow-menu button {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 12px;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+    color: #c9d1d9;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .card-overflow-menu button:hover { background: #21262d; }
+  .card-overflow-menu .danger-item { color: #f85149; }
+  .card-overflow-menu .danger-item:hover { background: #2d0000; }
+  /* Header overflow menu */
+  .header-overflow { position: relative; }
+  .header-overflow-btn {
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    padding: 8px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    transition: background 0.15s;
+  }
+  .header-overflow-btn:hover { background: #30363d; color: #c9d1d9; }
+  .header-overflow-menu {
+    display: none;
+    position: absolute;
+    right: 0;
+    top: 100%;
+    margin-top: 4px;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 8px 0;
+    min-width: 200px;
+    z-index: 50;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  }
+  .header-overflow-menu.open { display: block; }
+  .header-overflow-menu button,
+  .header-overflow-menu label {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 8px 16px;
+    font-size: 13px;
+    background: transparent;
+    border: none;
+    color: #c9d1d9;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  .header-overflow-menu button:hover,
+  .header-overflow-menu label:hover { background: #21262d; }
+  .header-overflow-menu select {
+    background: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+    margin-left: 8px;
+    cursor: pointer;
+  }
+  /* Contextual toolbar row */
+  .contextual-toolbar {
+    display: none;
+    gap: 8px;
+    margin-bottom: 12px;
+    padding: 8px 12px;
+    background: #161b22;
+    border: 1px solid #21262d;
+    border-radius: 8px;
+    align-items: center;
+  }
+  .contextual-toolbar.visible { display: flex; }
+  .card-actions { margin-top: 16px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 </style>
 </head>
 <body>
@@ -613,22 +751,31 @@ function renderHTML(): string {
   <h1><img src="/favicon.jpg" alt="" style="width:32px;height:32px;border-radius:6px;vertical-align:middle;margin-right:10px;">Git Status Dashboard</h1>
   <div class="header-right">
     <span class="summary" id="summary"></span>
-    <button onclick="pullAll()" id="pullAllBtn" style="display:none">⬇ Pull All Safe</button>
-    <button onclick="aiTriage()" id="triageBtn" class="header-ai-btn" style="display:none">🤖 What needs attention?</button>
     <button onclick="refresh()" id="refreshBtn">Refresh</button>
-    <select id="autoRefreshSelect" onchange="setAutoRefresh(this.value)" title="Auto-refresh interval">
-      <option value="0">Auto: Off</option>
-      <option value="30">Auto: 30s</option>
-      <option value="60">Auto: 1m</option>
-      <option value="300">Auto: 5m</option>
-      <option value="900">Auto: 15m</option>
-      <option value="1800">Auto: 30m</option>
-    </select>
-    <button onclick="showIgnored()" id="ignoredBtn" style="display:none">👁 Ignored (0)</button>
-    <button onclick="updateServer()" id="updateBtn">Check for Updates</button>
-    <button onclick="restartServer()" id="restartBtn">Restart Server</button>
+    <button onclick="showIgnored()" id="ignoredBtn" style="display:none">Ignored (0)</button>
+    <div class="header-overflow">
+      <button class="header-overflow-btn" onclick="toggleHeaderMenu(event)" title="Settings">...</button>
+      <div class="header-overflow-menu" id="headerOverflowMenu">
+        <label>Auto-refresh
+          <select id="autoRefreshSelect" onchange="setAutoRefresh(this.value)" title="Auto-refresh interval">
+            <option value="0">Off</option>
+            <option value="30">30s</option>
+            <option value="60">1m</option>
+            <option value="300">5m</option>
+            <option value="900">15m</option>
+            <option value="1800">30m</option>
+          </select>
+        </label>
+        <button onclick="updateServer(); closeHeaderMenu();" id="updateBtn">Check for Updates</button>
+        <button onclick="restartServer(); closeHeaderMenu();" id="restartBtn">Restart Server</button>
+      </div>
+    </div>
   </div>
 </header>
+<div class="contextual-toolbar" id="contextToolbar">
+  <button onclick="pullAll()" id="pullAllBtn">Pull All Safe</button>
+  <button onclick="aiTriage()" id="triageBtn" class="header-ai-btn">What needs attention?</button>
+</div>
 <div class="status-banner" id="statusBanner"></div>
 <div class="modal-overlay" id="deleteModal">
   <div class="modal">
@@ -661,6 +808,35 @@ let aiAvailable = false;
 let ignoredRepos = [];
 let showingIgnored = false;
 
+function toggleHeaderMenu(e) {
+  e.stopPropagation();
+  document.getElementById("headerOverflowMenu").classList.toggle("open");
+}
+function closeHeaderMenu() {
+  document.getElementById("headerOverflowMenu").classList.remove("open");
+}
+function toggleCardOverflow(e, id) {
+  e.stopPropagation();
+  var allMenus = document.querySelectorAll(".card-overflow-menu.open");
+  allMenus.forEach(function(m) { if (m.id !== id) m.classList.remove("open"); });
+  document.getElementById(id).classList.toggle("open");
+}
+document.addEventListener("click", function() {
+  closeHeaderMenu();
+  document.querySelectorAll(".card-overflow-menu.open").forEach(function(m) { m.classList.remove("open"); });
+});
+
+function remoteToWebUrl(remoteUrl) {
+  if (!remoteUrl) return null;
+  var url = remoteUrl.trim();
+  var sshMatch = url.match(/^git@([^:]+):(.+?)(\\.git)?$/);
+  if (sshMatch) return 'https://' + sshMatch[1] + '/' + sshMatch[2];
+  if (url.startsWith('https://') || url.startsWith('http://')) {
+    return url.replace(/\\.git$/, '');
+  }
+  return null;
+}
+
 function daysSince(isoDate) {
   if (!isoDate) return Infinity;
   return Math.floor((Date.now() - new Date(isoDate).getTime()) / 86400000);
@@ -671,6 +847,7 @@ fetch("/api/config").then(r => r.json()).then(c => {
   aiAvailable = c.aiAvailable || false;
   ignoredRepos = c.ignoredRepos || [];
   if (aiAvailable) document.getElementById("triageBtn").style.display = "";
+  else document.getElementById("triageBtn").style.display = "none";
   updateIgnoredBtn();
 });
 
@@ -767,19 +944,28 @@ function renderRepos(repos) {
   const safePullable = repos.filter(r => r.behind > 0 && r.uncommitted === 0 && !r.error).length;
   const showFolder = new Set(repos.map(r => r.folder)).size > 1;
 
-  const branchIssueTotal = repos.filter(r => hasBranchIssues(r)).length;
-  let summaryText = repos.length + " repos | " + dirty + " uncommitted | " + needsPush + " to push | " + needsPull + " to pull";
-  if (branchIssueTotal > 0) summaryText += " | " + branchIssueTotal + " branch issues";
-  document.getElementById("summary").textContent = summaryText;
+  document.getElementById("summary").textContent = repos.length + " repositories";
 
-  // Show/hide Pull All button
+  // Show/hide contextual toolbar
   const pullAllBtn = document.getElementById("pullAllBtn");
+  const triageBtn = document.getElementById("triageBtn");
+  const toolbar = document.getElementById("contextToolbar");
+  let showToolbar = false;
   if (safePullable > 0) {
     pullAllBtn.style.display = "";
-    pullAllBtn.textContent = "⬇ Pull All Safe (" + safePullable + ")";
+    pullAllBtn.textContent = "Pull All Safe (" + safePullable + ")";
+    showToolbar = true;
   } else {
     pullAllBtn.style.display = "none";
   }
+  if (aiAvailable && (dirty > 0 || needsPush > 0 || needsPull > 0)) {
+    triageBtn.style.display = "";
+    showToolbar = true;
+  } else {
+    triageBtn.style.display = "none";
+  }
+  if (showToolbar) toolbar.classList.add("visible");
+  else toolbar.classList.remove("visible");
 
   if (filtered.length === 0) {
     document.getElementById("content").innerHTML =
@@ -799,27 +985,21 @@ function renderRepos(repos) {
       if (repo.error) {
         badges += '<span class="badge badge-error">Error</span>';
       } else {
-        if (repo.uncommitted === 0 && repo.ahead === 0 && repo.behind === 0 && repo.hasRemote) {
-          badges += '<span class="badge badge-clean">Clean</span>';
-        }
         if (repo.uncommitted > 0) {
           badges += '<span class="badge badge-uncommitted">' + repo.uncommitted + ' uncommitted</span>';
         }
-        if (repo.ahead > 0) {
-          badges += '<span class="badge badge-ahead">' + repo.ahead + ' to push</span>';
-        }
-        if (repo.behind > 0) {
-          badges += '<span class="badge badge-behind">' + repo.behind + ' to pull</span>';
+        if (repo.ahead > 0 && repo.behind > 0) {
+          badges += '<span class="badge badge-sync">' + String.fromCharCode(8593) + repo.ahead + ' ' + String.fromCharCode(8595) + repo.behind + '</span>';
+        } else if (repo.ahead > 0) {
+          badges += '<span class="badge badge-sync">' + String.fromCharCode(8593) + repo.ahead + ' to push</span>';
+        } else if (repo.behind > 0) {
+          badges += '<span class="badge badge-sync">' + String.fromCharCode(8595) + repo.behind + ' to pull</span>';
         }
         if (!repo.hasRemote) {
           badges += '<span class="badge badge-no-remote">No remote</span>';
         }
         if (repo.detached) {
           badges += '<span class="badge badge-detached">Detached HEAD</span>';
-        }
-        const days = daysSince(repo.lastCommitDate);
-        if (days >= 30) {
-          badges += '<span class="badge badge-stale">Stale (' + days + 'd)</span>';
         }
       }
 
@@ -849,30 +1029,40 @@ function renderRepos(repos) {
         ? '<div class="folder-label">📁 ' + repo.folder.split('/').pop() + '</div>'
         : '';
 
-      // Last commit line
+      // Last commit line with stale coloring
       let lastCommitLine = '';
       if (repo.lastCommitDate) {
         const days = daysSince(repo.lastCommitDate);
         const ago = days === 0 ? 'today' : days === 1 ? 'yesterday' : days + ' days ago';
-        lastCommitLine = '<div class="last-commit">Last commit: ' + ago + '</div>';
+        const staleClass = days >= 90 ? ' stale-danger' : (days >= 30 ? ' stale-warn' : '');
+        lastCommitLine = '<div class="last-commit' + staleClass + '">Last commit: ' + ago + '</div>';
       }
 
-      // Action buttons
-      let actions = '<button class="open-btn" data-path="' + path + '" onclick="openInVSCode(this.dataset.path)">Open in VS Code</button>' +
-        '<button class="open-btn" data-path="' + path + '" onclick="revealInFinder(this.dataset.path)">Reveal in Finder</button>';
+      // Action buttons — icon row + contextual actions + overflow
+      const overflowId = 'of-' + name.replace(/[^a-zA-Z0-9]/g, '-');
+      const webUrl = remoteToWebUrl(repo.remoteUrl);
+      let actions = '<div class="icon-btn-row">' +
+        '<button class="icon-btn" data-path="' + path + '" onclick="openInVSCode(this.dataset.path)" title="Open in VS Code">&lt;/&gt;</button>' +
+        '<button class="icon-btn" data-path="' + path + '" onclick="revealInFinder(this.dataset.path)" title="Reveal in Finder">' + String.fromCharCode(9776) + '</button>' +
+        (webUrl ? '<a class="icon-btn" href="' + esc(webUrl) + '" target="_blank" rel="noopener" title="Open Website" style="text-decoration:none">' + String.fromCharCode(8599) + '</a>' : '') +
+        '</div>';
 
       if (repo.behind > 0) {
-        actions += '<button class="action-btn pull-btn" data-path="' + path + '" onclick="pullRepo(this)">⬇ Pull</button>';
+        actions += '<button class="action-btn pull-btn" data-path="' + path + '" onclick="pullRepo(this)">Pull</button>';
       }
       if (repo.ahead > 0) {
-        actions += '<button class="action-btn push-btn" data-path="' + path + '" onclick="pushRepo(this)">⬆ Push</button>';
+        actions += '<button class="action-btn push-btn" data-path="' + path + '" onclick="pushRepo(this)">Push</button>';
       }
       if (repo.uncommitted > 0 && aiAvailable) {
-        actions += '<button class="action-btn ai-btn" data-path="' + path + '" data-name="' + name + '" onclick="generateCommitMsg(this)">🤖 AI Commit Msg</button>';
+        actions += '<button class="action-btn ai-btn" data-path="' + path + '" data-name="' + name + '" onclick="generateCommitMsg(this)">AI Commit</button>';
       }
 
-      actions += '<button class="ignore-btn" data-path="' + path + '" onclick="ignoreRepo(this.dataset.path)">Ignore</button>';
-      actions += '<button class="delete-btn" data-path="' + path + '" data-name="' + name + '" onclick="openDeleteModal(this.dataset.path, this.dataset.name)">Delete</button>';
+      actions += '<div class="card-overflow">' +
+        '<button class="card-overflow-btn" onclick="toggleCardOverflow(event, \\'' + overflowId + '\\')" title="More actions">...</button>' +
+        '<div class="card-overflow-menu" id="' + overflowId + '">' +
+        '<button onclick="ignoreRepo(\\'' + path + '\\')">Ignore</button>' +
+        '<button class="danger-item" onclick="openDeleteModal(\\'' + path + '\\', \\'' + name + '\\')">Delete</button>' +
+        '</div></div>';
 
       return '<div class="card ' + cls + '">' +
         folderLabel +
@@ -970,7 +1160,7 @@ async function pushRepo(btn) {
 async function pullAll() {
   const btn = document.getElementById("pullAllBtn");
   btn.disabled = true;
-  btn.textContent = "⬇ Pulling...";
+  btn.textContent = "Pulling...";
   showBanner("Pulling all safe repos...", "info");
   try {
     const res = await fetch("/api/pull-all", { method: "POST" });
@@ -996,7 +1186,7 @@ async function generateCommitMsg(btn) {
   const name = btn.dataset.name;
   const orig = btn.textContent;
   btn.disabled = true;
-  btn.textContent = "🤖 Generating...";
+  btn.textContent = "Generating...";
   try {
     const res = await fetch("/api/ai-commit-msg", {
       method: "POST",
@@ -1042,7 +1232,7 @@ document.getElementById("commitMsgModal").addEventListener("click", function(e) 
 async function aiTriage() {
   const btn = document.getElementById("triageBtn");
   btn.disabled = true;
-  btn.textContent = "🤖 Analyzing...";
+  btn.textContent = "Analyzing...";
   showBanner("Running AI triage analysis...", "info");
   try {
     const res = await fetch("/api/ai-triage", { method: "POST" });
@@ -1056,14 +1246,14 @@ async function aiTriage() {
     showBanner("AI Triage failed: " + e.message, "");
   }
   btn.disabled = false;
-  btn.textContent = "🤖 What needs attention?";
+  btn.textContent = "What needs attention?";
 }
 
 function updateIgnoredBtn() {
   const btn = document.getElementById("ignoredBtn");
   if (ignoredRepos.length > 0) {
     btn.style.display = "";
-    btn.textContent = showingIgnored ? "👁 Hide Ignored (" + ignoredRepos.length + ")" : "👁 Ignored (" + ignoredRepos.length + ")";
+    btn.textContent = showingIgnored ? "Hide Ignored (" + ignoredRepos.length + ")" : "Ignored (" + ignoredRepos.length + ")";
   } else {
     btn.style.display = "none";
     showingIgnored = false;
